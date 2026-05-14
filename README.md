@@ -16,3 +16,6 @@
 
 **Diagrama:**
 
+<img width="498" height="366" alt="image" src="https://github.com/user-attachments/assets/aad2afcd-e279-4c87-8d01-df4adfc387e5" />
+
+
