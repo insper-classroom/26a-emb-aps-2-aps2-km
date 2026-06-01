@@ -1,395 +1,372 @@
-/**
- * subway_controller_rtos.c - Controle com RTOS para Subway Surfers
- * 
- * Estrutura com FreeRTOS:
- * - Task_IMU: Lê acelerômetro e envia comandos de direção para a fila
- * - Task_Botoes: Lê botões com debounce e envia comandos para a fila
- * - Task_Comunicacao: Processa fila e envia comandos pela USB Serial
- * - Task_LED: Gerencia LED de conexão/status
- * 
- * Conexões:
- * - MPU6050 SDA -> GPIO2, SCL -> GPIO3
- * - Botão LIGA/DESLIGA -> GPIO8
- * - Botão DESLIZE_ESQUERDA_2X -> GPIO9
- * - Botão HOVER (Espaço) -> GPIO10
- * - Botão PULAR -> GPIO11
- * - Botão DESLIZAR -> GPIO12
- * - Potenciômetro -> GPIO26 (ADC0)
- * - LED Conexão -> GPIO25
- */
-
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
 #include "pico/stdlib.h"
-#include "pico/binary_info.h"
 #include "hardware/i2c.h"
 #include "hardware/adc.h"
 #include "hardware/gpio.h"
+#include "hardware/uart.h"
+#include "hardware/irq.h"
+
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
 #include "semphr.h"
 
+
 // ========== CONFIGURAÇÕES DOS PINOS ==========
-#define I2C_PORT i2c1
-#define I2C_SDA_PIN 2
-#define I2C_SCL_PIN 3
+#define I2C_PORT        i2c1
+#define I2C_SDA_PIN     2
+#define I2C_SCL_PIN     3
 
-#define BTN_LIGA_PIN 8                   // Botão liga/desliga (GPIO8)
-#define BTN_DESLIZE_ESQUERDA_2X_PIN 9    // Botão deslizar 2x esquerda
-#define BTN_HOVER_PIN 10                 // Botão Hoverboard (Espaço)
-#define BTN_PULAR_PIN 11
-#define BTN_DESLIZAR_PIN 12
-#define LED_CONEXAO_PIN 25               // LED de indicação de conexão
-#define POT_PIN 26                       // ADC0
+#define BTN_LIGA_PIN              8
+#define BTN_DESLIZE_ESQUERDA_2X_PIN 9
+#define BTN_HOVER_PIN             10
+#define BTN_PULAR_PIN             11
+#define BTN_DESLIZAR_PIN          12
 
-// ========== CONFIGURAÇÕES DO MPU6050 ==========
-#define MPU6050_ADDR 0x68
+#define LED_CONEXAO_PIN 25
+#define POT_PIN         26
+
+// ========== CONFIGURAÇÕES MPU6050 ==========
+#define MPU6050_ADDR  0x68
 #define I2C_BAUD_RATE 400000
-#define PWR_MGMT_1 0x6B
-#define ACCEL_XOUT_H 0x3B
-#define WHO_AM_I 0x75
+#define PWR_MGMT_1    0x6B
+#define ACCEL_XOUT_H  0x3B
+#define WHO_AM_I      0x75
 
 // ========== PARÂMETROS DE SENSIBILIDADE ==========
-#define THRESHOLD_MIN 3000
-#define THRESHOLD_MAX 10000
-#define DEADZONE_BASE 1500
 #define CALIBRATION_SAMPLES 50
+#define SENS_THRESHOLD      4500
+#define SENS_DEADZONE       1200
+
+// ========== CONFIGURAÇÕES HC-06 ==========
+#define HC06_NAME "SUBWAY_CTRL"
+#define HC06_PIN  "1234"
 
 // ========== CONFIGURAÇÕES RTOS ==========
-#define TASK_STACK_SIZE 256
-#define TASK_IMU_PRIORITY 2
-#define TASK_BOTOES_PRIORITY 2
-#define TASK_COMUNICACAO_PRIORITY 2
-#define TASK_LED_PRIORITY 1
+#define TASK_STACK_SIZE         512     // aumentado para acomodar BT
+#define TASK_IMU_PRIORITY       2
+#define TASK_BOTOES_PRIORITY    2
+#define TASK_COMUNICACAO_PRIORITY 3     // mais alta: não pode perder comandos
+#define TASK_LED_PRIORITY       1
 
-#define QUEUE_LENGTH 32
-#define BTN_DEBOUNCE_MS 50
-#define LOOP_DELAY_MS 30
+#define QUEUE_CMDS_LENGTH   32          // fila de comandos (IMU + botões)
+#define QUEUE_BT_TX_LENGTH  128         // fila de bytes para TX Bluetooth
+#define BTN_DEBOUNCE_MS     50
+#define LOOP_IMU_MS         30
 
-// ========== TIPOS DE DADOS ==========
+// ========== CONFIGURAÇÕES HC-06 ==========
+#define HC06_UART_ID    uart1
+#define HC06_BAUD_RATE  115200
+#define HC06_TX_PIN     4       // Pico TX -> HC-06 RX
+#define HC06_RX_PIN     5 
 
-// Comandos que podem ser enviados para o PC
+// ========== CONFIGURAÇÕES DOS PINOS ==========
+#define LED_CALIBRADO_PIN 25   // <-- adiciona esta linha junto aos outros defines
+
+// ========== TIPOS ==========
 typedef enum {
     CMD_ESQUERDA = 'L',
-    CMD_DIREITA = 'R',
-    CMD_PULAR = 'U',
+    CMD_DIREITA  = 'R',
+    CMD_PULAR    = 'U',
     CMD_DESLIZAR = 'D',
-    CMD_HOVER = 'H',        // Hoverboard (Espaço)
-    CMD_NEUTRO = 'S'
+    CMD_HOVER    = 'H',
+    CMD_NEUTRO   = 'S'
 } comando_t;
 
-// Estrutura para mensagens na fila
 typedef struct {
     comando_t cmd;
-    uint32_t timestamp_ms;
+    uint32_t  timestamp_ms;
 } mensagem_t;
 
-// Estrutura para parâmetros de sensibilidade (protegida por semáforo)
-typedef struct {
-    int16_t threshold;
-    int16_t deadzone;
-} sensibilidade_t;
-
 // ========== HANDLES GLOBAIS ==========
-static QueueHandle_t xComandoQueue = NULL;
-static SemaphoreHandle_t xSensibilidadeMutex = NULL;
-static sensibilidade_t g_sensibilidade = {THRESHOLD_MIN, DEADZONE_BASE};
-static int16_t g_neutral_x = 0;
+static QueueHandle_t xComandoQueue = NULL;  // fila de comandos do jogo
+static QueueHandle_t xBtTxQueue   = NULL;  // fila de bytes para o HC-06
 static SemaphoreHandle_t xNeutralMutex = NULL;
 
-// Controle do botão liga/desliga
-static bool sistema_ligado = true;
+static int16_t g_neutral_x    = 0;
+static bool    sistema_ligado = true;
 
-// ========== FUNÇÕES DO MPU6050 ==========
+// ========== BLUETOOTH: IRQ RX (não usado ativamente, mas útil para debug) ==========
+// Se quiser receber comandos do celular via BT no futuro, use este handler.
+static void uart_bt_rx_handler(void) {
+    // Descarta por enquanto; estenda aqui para receber ACKs ou comandos remotos
+    while (uart_is_readable(HC06_UART_ID)) {
+        uart_getc(HC06_UART_ID);   // flush
+    }
+}
 
-void mpu6050_write_register(uint8_t reg, uint8_t data) {
+static void init_bt_uart(void) {
+    uart_init(HC06_UART_ID, HC06_BAUD_RATE);
+    gpio_set_function(HC06_TX_PIN, UART_FUNCSEL_NUM(HC06_UART_ID, HC06_TX_PIN));
+    gpio_set_function(HC06_RX_PIN, UART_FUNCSEL_NUM(HC06_UART_ID, HC06_RX_PIN));
+    uart_set_baudrate(HC06_UART_ID, HC06_BAUD_RATE);
+    uart_set_hw_flow(HC06_UART_ID, false, false);
+    uart_set_format(HC06_UART_ID, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(HC06_UART_ID, false);
+
+    int UART_IRQ = (HC06_UART_ID == uart0) ? UART0_IRQ : UART1_IRQ;
+    irq_set_exclusive_handler(UART_IRQ, uart_bt_rx_handler);
+    irq_set_enabled(UART_IRQ, true);
+    uart_set_irq_enables(HC06_UART_ID, true, false);
+}
+
+// ========== TASK: TX BLUETOOTH ==========
+// Consome xBtTxQueue e envia byte a byte pela UART do HC-06.
+// Separado da task_comunicacao para não bloquear o processamento de comandos.
+static void task_bt_tx(void *pvParameters) {
+    uint8_t ch;
+    while (1) {
+        if (xQueueReceive(xBtTxQueue, &ch, portMAX_DELAY) == pdTRUE) {
+            uart_putc_raw(HC06_UART_ID, ch);
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+// Helper: enfileira string na fila BT (não bloqueia)
+static void bt_enqueue_str(const char *str) {
+    while (*str) {
+        xQueueSend(xBtTxQueue, (const void *)str, 0);
+        str++;
+    }
+}
+
+// ========== MPU6050 ==========
+static void mpu6050_write_register(uint8_t reg, uint8_t data) {
     uint8_t buf[2] = {reg, data};
     i2c_write_blocking(I2C_PORT, MPU6050_ADDR, buf, 2, false);
 }
 
-int16_t mpu6050_read_16bit(uint8_t reg) {
+static int16_t mpu6050_read_16bit(uint8_t reg) {
     uint8_t buf[2];
     i2c_write_blocking(I2C_PORT, MPU6050_ADDR, &reg, 1, true);
     i2c_read_blocking(I2C_PORT, MPU6050_ADDR, buf, 2, false);
     return (int16_t)((buf[0] << 8) | buf[1]);
 }
 
-int16_t read_accel_x(void) {
+static int16_t read_accel_x(void) {
     return mpu6050_read_16bit(ACCEL_XOUT_H);
 }
 
-bool mpu6050_init(void) {
+static bool mpu6050_init(void) {
     uint8_t who_am_i = 0;
     uint8_t reg = WHO_AM_I;
     i2c_write_blocking(I2C_PORT, MPU6050_ADDR, &reg, 1, true);
     i2c_read_blocking(I2C_PORT, MPU6050_ADDR, &who_am_i, 1, false);
-    
-    if (who_am_i != 0x68) {
-        return false;
-    }
+    if (who_am_i != 0x68) return false;
     mpu6050_write_register(PWR_MGMT_1, 0x00);
     return true;
 }
 
-// ========== FUNÇÃO PARA ENVIAR 2X ESQUERDA ==========
-void enviar_duas_esquerdas(void) {
-    // Envia primeiro comando de ESQUERDA
-    mensagem_t msg1 = {.cmd = CMD_ESQUERDA, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
-    xQueueSend(xComandoQueue, &msg1, 0);
-    printf("[BOTAO] 1a ESQUERDA enviada\n");
-    
-    // Aguarda para garantir que o primeiro comando foi processado
+// ========== HELPER: 2X ESQUERDA ==========
+static void enviar_duas_esquerdas(void) {
+    mensagem_t msg  = {.cmd = CMD_ESQUERDA, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
+    mensagem_t neutro = {.cmd = CMD_NEUTRO,   .timestamp_ms = msg.timestamp_ms};
+
+    xQueueSend(xComandoQueue, &msg, 0);
+    printf("[BOTAO] 1a ESQUERDA\n");
     vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // Envia comando NEUTRO para "soltar" a tecla entre os movimentos
-    mensagem_t msg_neutro = {.cmd = CMD_NEUTRO, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
-    xQueueSend(xComandoQueue, &msg_neutro, 0);
-    
-    // Aguarda para dar tempo do personagem parar
+
+    xQueueSend(xComandoQueue, &neutro, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // Envia segundo comando de ESQUERDA
-    mensagem_t msg2 = {.cmd = CMD_ESQUERDA, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
-    xQueueSend(xComandoQueue, &msg2, 0);
-    printf("[BOTAO] 2a ESQUERDA enviada\n");
-    
-    // Aguarda e envia neutro novamente
+
+    msg.timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    xQueueSend(xComandoQueue, &msg, 0);
+    printf("[BOTAO] 2a ESQUERDA\n");
     vTaskDelay(pdMS_TO_TICKS(50));
-    xQueueSend(xComandoQueue, &msg_neutro, 0);
-    
+
+    neutro.timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    xQueueSend(xComandoQueue, &neutro, 0);
     printf("[BOTAO] DUAS ESQUERDAS concluido!\n");
 }
 
-// ========== TASK: IMU ESTÁVEL E FUNCIONAL (COM PAUSA) ==========
-
-void task_imu(void *pvParameters) {
-    TickType_t xLastWakeTime;
-    
-    // Calibração (só executa uma vez no início)
-    int16_t neutral;
+// ========== TASK: IMU ==========
+static void task_imu(void *pvParameters) {
+    // Calibração inicial
     int32_t sum = 0;
     printf("[IMU] Calibrando... Mantenha o controle PARADO!\n");
     for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
         sum += read_accel_x();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    neutral = (int16_t)(sum / CALIBRATION_SAMPLES);
-    
+    int16_t neutral = (int16_t)(sum / CALIBRATION_SAMPLES);
+
     if (xSemaphoreTake(xNeutralMutex, portMAX_DELAY) == pdTRUE) {
         g_neutral_x = neutral;
         xSemaphoreGive(xNeutralMutex);
     }
+    printf("[IMU] Calibrado! Neutro = %d | Threshold = %d\n", neutral, SENS_THRESHOLD);
     
-    printf("[IMU] Calibrado! Neutro = %d\n", neutral);
-    
+
     comando_t last_sent = CMD_NEUTRO;
-    TickType_t last_send_time = 0;
-    
-    // VALORES TESTADOS E FUNCIONAIS
-    int16_t SENS_THRESHOLD = 4500;
-    int16_t SENS_DEADZONE = 1200;
-    
-    printf("[IMU] Threshold = %d, Deadzone = %d\n", SENS_THRESHOLD, SENS_DEADZONE);
-    printf("[IMU] Controle parado NAO deve enviar comandos!\n");
-    
+    TickType_t xLastWakeTime;
+    int debug_count = 0;
+
     while (1) {
-        // Se o sistema estiver desligado, apenas espera
         if (!sistema_ligado) {
             vTaskDelay(pdMS_TO_TICKS(100));
-            continue;  // Pula o resto do loop
+            continue;
         }
-        
+
         xLastWakeTime = xTaskGetTickCount();
-        
-        int16_t accel_x = read_accel_x();
+
+        int16_t accel_x  = read_accel_x();
         int32_t deviation = (int32_t)accel_x - (int32_t)neutral;
-        
-        // MOSTRA VALORES REAIS
-        static int debug_count = 0;
-        debug_count++;
-        if (debug_count >= 50) {
+
+        // Debug a cada ~1.5 s
+        if (++debug_count >= 50) {
             debug_count = 0;
-            printf("[INFO] accel=%d, neutro=%d, desvio=%d (threshold=%d)\n", 
-                   accel_x, neutral, deviation, SENS_THRESHOLD);
+            printf("[IMU] accel=%d neutro=%d desvio=%d\n", accel_x, neutral, deviation);
         }
-        
-        // Lógica com zona morta
-        comando_t desired_cmd = CMD_NEUTRO;
-        
-        if (deviation > SENS_THRESHOLD) {
-            desired_cmd = CMD_DIREITA;
-            printf("[MOVE] >>> DIREITA! desvio=%d\n", deviation);
-        } else if (deviation < -SENS_THRESHOLD) {
-            desired_cmd = CMD_ESQUERDA;
-            printf("[MOVE] <<< ESQUERDA! desvio=%d\n", deviation);
+
+        comando_t desired = CMD_NEUTRO;
+        if (deviation >  SENS_THRESHOLD) desired = CMD_DIREITA;
+        else if (deviation < -SENS_THRESHOLD) desired = CMD_ESQUERDA;
+
+        if (desired != last_sent) {
+            mensagem_t msg = {
+                .cmd = (desired != CMD_NEUTRO) ? desired : CMD_NEUTRO,
+                .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS
+            };
+            xQueueSend(xComandoQueue, &msg, 0);
+            printf("[IMU] Enviando: %c\n", msg.cmd);
+            last_sent = desired;
         }
-        
-        // Só envia se mudou o estado
-        if (desired_cmd != last_sent) {
-            if (desired_cmd != CMD_NEUTRO) {
-                mensagem_t msg = {.cmd = desired_cmd, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
-                xQueueSend(xComandoQueue, &msg, 0);
-                last_send_time = xTaskGetTickCount();
-                printf("[ENVIO] Comando: %c\n", desired_cmd);
-            } else if (last_sent != CMD_NEUTRO) {
-                mensagem_t msg = {.cmd = CMD_NEUTRO, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
-                xQueueSend(xComandoQueue, &msg, 0);
-                printf("[ENVIO] Comando: S (parado)\n");
-            }
-            last_sent = desired_cmd;
-        }
-        
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(LOOP_DELAY_MS));
+
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(LOOP_IMU_MS));
+    }
+
+    // Pisca 2x para indicar calibração concluída
+    for (int i = 0; i < 2; i++) {
+        gpio_put(LED_CALIBRADO_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(400));
+        gpio_put(LED_CALIBRADO_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(400));
     }
     vTaskDelete(NULL);
 }
 
-// ========== TASK: LEITURA DOS BOTÕES ==========
-
-void task_botoes(void *pvParameters) {
+// ========== TASK: BOTÕES ==========
+static void task_botoes(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    
-    // Estados anteriores para detecção de borda
-    bool last_liga = true;
-    bool last_deslize_esquerda_2x = true;
-    bool last_hover = true;
-    bool last_pular = true;
-    bool last_deslizar = true;
-    
-    // Timestamps para debounce
-    uint32_t last_liga_time = 0;
-    uint32_t last_deslize_esquerda_2x_time = 0;
-    uint32_t last_hover_time = 0;
-    uint32_t last_pular_time = 0;
-    uint32_t last_deslizar_time = 0;
-    
+
+    bool last_liga              = true;
+    bool last_deslize_esq_2x   = true;
+    bool last_hover             = true;
+    bool last_pular             = true;
+    bool last_deslizar          = true;
+
+    uint32_t t_liga = 0, t_esq2x = 0, t_hover = 0, t_pular = 0, t_deslizar = 0;
+
     while (1) {
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        
-        // Botão LIGA/DESLIGA (GP8)
-        bool current_liga = gpio_get(BTN_LIGA_PIN);
-        if (!current_liga && last_liga && (now - last_liga_time) > BTN_DEBOUNCE_MS) {
-            last_liga_time = now;
+
+        // --- LIGA/DESLIGA ---
+        bool cur_liga = gpio_get(BTN_LIGA_PIN);
+        if (!cur_liga && last_liga && (now - t_liga) > BTN_DEBOUNCE_MS) {
+            t_liga = now;
             sistema_ligado = !sistema_ligado;
-            
-            if (sistema_ligado) {
-                printf("[SISTEMA] LIGADO\n");
-                // Opcional: enviar um comando de heartbeatao ligar
-                mensagem_t msg = {.cmd = CMD_NEUTRO, .timestamp_ms = now};
-                xQueueSend(xComandoQueue, &msg, 0);
-            } else {
-                printf("[SISTEMA] DESLIGADO\n");
-                // Quando desliga, envia comando NEUTRO para parar qualquer movimento
-                mensagem_t msg = {.cmd = CMD_NEUTRO, .timestamp_ms = now};
-                xQueueSend(xComandoQueue, &msg, 0);
-                // Solta todas as teclas via Python (o Python vai receber S)
-            }
+            mensagem_t msg = {.cmd = CMD_NEUTRO, .timestamp_ms = now};
+            xQueueSend(xComandoQueue, &msg, 0);
+            printf("[SISTEMA] %s\n", sistema_ligado ? "LIGADO" : "DESLIGADO");
         }
-        last_liga = current_liga;
-        
-        // Só processa os outros botoes se o sistema estiver ligado
+        last_liga = cur_liga;
+
         if (sistema_ligado) {
-            // Botão DESLIZE ESQUERDA 2X (GP9)
-            bool current_deslize_esquerda_2x = gpio_get(BTN_DESLIZE_ESQUERDA_2X_PIN);
-            if (!current_deslize_esquerda_2x && last_deslize_esquerda_2x && 
-                (now - last_deslize_esquerda_2x_time) > BTN_DEBOUNCE_MS) {
-                last_deslize_esquerda_2x_time = now;
+            // --- DESLIZE 2X ESQUERDA ---
+            bool cur_esq2x = gpio_get(BTN_DESLIZE_ESQUERDA_2X_PIN);
+            if (!cur_esq2x && last_deslize_esq_2x && (now - t_esq2x) > BTN_DEBOUNCE_MS) {
+                t_esq2x = now;
                 enviar_duas_esquerdas();
             }
-            last_deslize_esquerda_2x = current_deslize_esquerda_2x;
-            
-            // Botão HOVER (GP10) - Espaço
-            bool current_hover = gpio_get(BTN_HOVER_PIN);
-            if (!current_hover && last_hover && (now - last_hover_time) > BTN_DEBOUNCE_MS) {
-                last_hover_time = now;
+            last_deslize_esq_2x = cur_esq2x;
+
+            // --- HOVER ---
+            bool cur_hover = gpio_get(BTN_HOVER_PIN);
+            if (!cur_hover && last_hover && (now - t_hover) > BTN_DEBOUNCE_MS) {
+                t_hover = now;
                 mensagem_t msg = {.cmd = CMD_HOVER, .timestamp_ms = now};
                 xQueueSend(xComandoQueue, &msg, 0);
-                printf("[BOTAO] HOVERBOARD (ESPACO)!\n");
+                printf("[BOTAO] HOVERBOARD\n");
             }
-            last_hover = current_hover;
-            
-            // Botão PULAR (GP11)
-            bool current_pular = gpio_get(BTN_PULAR_PIN);
-            if (!current_pular && last_pular && (now - last_pular_time) > BTN_DEBOUNCE_MS) {
-                last_pular_time = now;
+            last_hover = cur_hover;
+
+            // --- PULAR ---
+            bool cur_pular = gpio_get(BTN_PULAR_PIN);
+            if (!cur_pular && last_pular && (now - t_pular) > BTN_DEBOUNCE_MS) {
+                t_pular = now;
                 mensagem_t msg = {.cmd = CMD_PULAR, .timestamp_ms = now};
                 xQueueSend(xComandoQueue, &msg, 0);
-                printf("[BOTAO] PULAR!\n");
+                printf("[BOTAO] PULAR\n");
             }
-            last_pular = current_pular;
-            
-            // Botão DESLIZAR (GP12)
-            bool current_deslizar = gpio_get(BTN_DESLIZAR_PIN);
-            if (!current_deslizar && last_deslizar && (now - last_deslizar_time) > BTN_DEBOUNCE_MS) {
-                last_deslizar_time = now;
+            last_pular = cur_pular;
+
+            // --- DESLIZAR ---
+            bool cur_deslizar = gpio_get(BTN_DESLIZAR_PIN);
+            if (!cur_deslizar && last_deslizar && (now - t_deslizar) > BTN_DEBOUNCE_MS) {
+                t_deslizar = now;
                 mensagem_t msg = {.cmd = CMD_DESLIZAR, .timestamp_ms = now};
                 xQueueSend(xComandoQueue, &msg, 0);
-                printf("[BOTAO] DESLIZAR!\n");
+                printf("[BOTAO] DESLIZAR\n");
             }
-            last_deslizar = current_deslizar;
+            last_deslizar = cur_deslizar;
         } else {
-            // Se o sistema está desligado, atualiza os estados anteriores mesmo assim
-            // para não disparar comandos quando religar
-            last_deslize_esquerda_2x = gpio_get(BTN_DESLIZE_ESQUERDA_2X_PIN);
-            last_hover = gpio_get(BTN_HOVER_PIN);
-            last_pular = gpio_get(BTN_PULAR_PIN);
-            last_deslizar = gpio_get(BTN_DESLIZAR_PIN);
+            // Atualiza estados para não disparar ao religar
+            last_deslize_esq_2x = gpio_get(BTN_DESLIZE_ESQUERDA_2X_PIN);
+            last_hover           = gpio_get(BTN_HOVER_PIN);
+            last_pular           = gpio_get(BTN_PULAR_PIN);
+            last_deslizar        = gpio_get(BTN_DESLIZAR_PIN);
         }
-        
+
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(20));
     }
     vTaskDelete(NULL);
 }
 
-// ========== TASK: COMUNICAÇÃO SERIAL ==========
-
-void task_comunicacao(void *pvParameters) {
+// ========== TASK: COMUNICAÇÃO (USB Serial + Bluetooth) ==========
+static void task_comunicacao(void *pvParameters) {
     mensagem_t msg;
-    comando_t last_sent = CMD_NEUTRO;
-    TickType_t last_heartbeat = xTaskGetTickCount();
-    
+    char buf[4];   // ex: "L\n\0"
+
     while (1) {
         if (xQueueReceive(xComandoQueue, &msg, pdMS_TO_TICKS(100))) {
-            // Só envia comandos se o sistema estiver ligado
-            // Exceto comandos especiais se houver
             if (sistema_ligado || msg.cmd == CMD_NEUTRO) {
+
+                // 1) Envia pela USB Serial (lido pelo subway_controller.py)
                 printf("%c\n", msg.cmd);
-                
-                switch(msg.cmd) {
-                    case CMD_ESQUERDA: printf("  ⬅️ ESQUERDA\n"); break;
-                    case CMD_DIREITA: printf("  ➡️ DIREITA\n"); break;
-                    case CMD_PULAR: printf("  🔼 PULAR\n"); break;
-                    case CMD_DESLIZAR: printf("  🔽 DESLIZAR\n"); break;
-                    case CMD_HOVER: printf("  🛹 HOVERBOARD (ESPACO)\n"); break;
-                    case CMD_NEUTRO: break;
+
+                // 2) Envia pelo Bluetooth (mesmo protocolo: "<CHAR>\n")
+                //    Enfileira na fila BT para task_bt_tx enviar sem bloquear
+                snprintf(buf, sizeof(buf), "%c\n", msg.cmd);
+                bt_enqueue_str(buf);
+
+                // Debug visual no terminal USB
+                switch (msg.cmd) {
+                    case CMD_ESQUERDA: printf("  [BT+USB] ESQUERDA\n");   break;
+                    case CMD_DIREITA:  printf("  [BT+USB] DIREITA\n");    break;
+                    case CMD_PULAR:    printf("  [BT+USB] PULAR\n");      break;
+                    case CMD_DESLIZAR: printf("  [BT+USB] DESLIZAR\n");   break;
+                    case CMD_HOVER:    printf("  [BT+USB] HOVERBOARD\n"); break;
+                    case CMD_NEUTRO:   break;
                 }
-                last_sent = msg.cmd;
             }
-        }
-        
-        // Heartbeat a cada 5 segundos (indica que o controle está vivo)
-        if ((xTaskGetTickCount() - last_heartbeat) > pdMS_TO_TICKS(5000)) {
-            last_heartbeat = xTaskGetTickCount();
         }
     }
     vTaskDelete(NULL);
 }
 
-// ========== TASK: LED DE STATUS ==========
-
-void task_led(void *pvParameters) {
+// ========== TASK: LED ==========
+static void task_led(void *pvParameters) {
     bool led_state = false;
-    
     while (1) {
         if (sistema_ligado) {
-            // Pisca lentamente quando ligado
             led_state = !led_state;
             gpio_put(LED_CONEXAO_PIN, led_state);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(500));   // pisca lento = ativo
         } else {
-            // Apagado quando desligado
             gpio_put(LED_CONEXAO_PIN, 0);
             vTaskDelay(pdMS_TO_TICKS(500));
         }
@@ -397,96 +374,101 @@ void task_led(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-// ========== CONFIGURAÇÕES DE HARDWARE ==========
-
-void setup_hardware(void) {
-    // I2C
+// ========== HARDWARE ==========
+static void setup_hardware(void) {
+    // I2C (MPU6050)
     i2c_init(I2C_PORT, I2C_BAUD_RATE);
     gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA_PIN);
     gpio_pull_up(I2C_SCL_PIN);
-    
-    // Botões (pull-up interno)
-    gpio_init(BTN_LIGA_PIN);
-    gpio_set_dir(BTN_LIGA_PIN, GPIO_IN);
-    gpio_pull_up(BTN_LIGA_PIN);
-    
-    gpio_init(BTN_DESLIZE_ESQUERDA_2X_PIN);
-    gpio_set_dir(BTN_DESLIZE_ESQUERDA_2X_PIN, GPIO_IN);
-    gpio_pull_up(BTN_DESLIZE_ESQUERDA_2X_PIN);
-    
-    gpio_init(BTN_HOVER_PIN);
-    gpio_set_dir(BTN_HOVER_PIN, GPIO_IN);
-    gpio_pull_up(BTN_HOVER_PIN);
-    
-    gpio_init(BTN_PULAR_PIN);
-    gpio_set_dir(BTN_PULAR_PIN, GPIO_IN);
-    gpio_pull_up(BTN_PULAR_PIN);
-    
-    gpio_init(BTN_DESLIZAR_PIN);
-    gpio_set_dir(BTN_DESLIZAR_PIN, GPIO_IN);
-    gpio_pull_up(BTN_DESLIZAR_PIN);
-    
+
+    // Botões
+    const uint btn_pins[] = {
+        BTN_LIGA_PIN, BTN_DESLIZE_ESQUERDA_2X_PIN,
+        BTN_HOVER_PIN, BTN_PULAR_PIN, BTN_DESLIZAR_PIN
+    };
+    for (int i = 0; i < 5; i++) {
+        gpio_init(btn_pins[i]);
+        gpio_set_dir(btn_pins[i], GPIO_IN);
+        gpio_pull_up(btn_pins[i]);
+    }
+
     // LED
     gpio_init(LED_CONEXAO_PIN);
     gpio_set_dir(LED_CONEXAO_PIN, GPIO_OUT);
     gpio_put(LED_CONEXAO_PIN, 1);
-    
+
     // ADC
     adc_init();
     adc_gpio_init(POT_PIN);
     adc_select_input(0);
 }
 
-// ========== FUNÇÃO PRINCIPAL ==========
-
+// ========== MAIN ==========
 int main(void) {
     stdio_init_all();
-    sleep_ms(2000);
-    
+    sleep_ms(2000);   // aguarda terminal USB
+
     printf("\n========================================\n");
-    printf("   SUBWAY SURFERS CONTROLLER - RTOS\n");
-    printf("   Estrutura: Tasks + Filas + Semáforos\n");
+    printf("   SUBWAY SURFERS CONTROLLER - RTOS + BT\n");
+    printf("   IMU MPU6050 | Bluetooth HC-06\n");
     printf("========================================\n\n");
-    
+
     setup_hardware();
-    
+
+    // Inicializa e configura HC-06
+    printf("[BT] Inicializando HC-06...\n");
+    init_bt_uart();
+    // Descomente a linha abaixo na PRIMEIRA vez para gravar nome/PIN no módulo.
+    // Depois comente de novo para não perder tempo no boot.
+    // hc06_config(HC06_NAME, HC06_PIN);
+    printf("[BT] HC-06 pronto (UART1 @ %d baud)\n\n", HC06_BAUD_RATE);
+
     if (!mpu6050_init()) {
-        printf("ERRO: MPU6050 nao encontrado!\n");
+        printf("ERRO: MPU6050 nao encontrado! Verifique I2C.\n");
         while (1) { tight_loop_contents(); }
     }
-    printf("MPU6050 inicializado!\n");
-    
-    xComandoQueue = xQueueCreate(QUEUE_LENGTH, sizeof(mensagem_t));
+    printf("[IMU] MPU6050 inicializado!\n\n");
+
+    // Filas
+    xComandoQueue = xQueueCreate(QUEUE_CMDS_LENGTH, sizeof(mensagem_t));
+    xBtTxQueue    = xQueueCreate(QUEUE_BT_TX_LENGTH, sizeof(uint8_t));
     configASSERT(xComandoQueue != NULL);
-    
-    xSensibilidadeMutex = xSemaphoreCreateMutex();
-    configASSERT(xSensibilidadeMutex != NULL);
-    
+    configASSERT(xBtTxQueue    != NULL);
+
+    // Semáforos
     xNeutralMutex = xSemaphoreCreateMutex();
     configASSERT(xNeutralMutex != NULL);
-    
-    xTaskCreate(task_imu, "IMU_Task", TASK_STACK_SIZE, NULL, TASK_IMU_PRIORITY, NULL);
-    xTaskCreate(task_botoes, "Botoes_Task", TASK_STACK_SIZE, NULL, TASK_BOTOES_PRIORITY, NULL);
-    xTaskCreate(task_comunicacao, "Com_Task", TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY, NULL);
-    xTaskCreate(task_led, "LED_Task", TASK_STACK_SIZE, NULL, TASK_LED_PRIORITY, NULL);
-    
-    printf("\n✅ RTOS iniciado! Tasks criadas:\n");
-    printf("   - IMU_Task (le acelerometro)\n");
-    printf("   - Botoes_Task (le botoes: LIGA, GP9, HOVER, PULAR, DESLIZAR)\n");
-    printf("   - ADC_Task (le potenciometro)\n");
-    printf("   - Com_Task (envia comandos)\n");
-    printf("   - LED_Task (gerencia LED)\n");
-    printf("\n🎮 Controle pronto!\n");
-    printf("📌 GPIO8 = LIGA/DESLIGA\n");
-    printf("📌 GPIO9 = DESLIZAR 2X ESQUERDA\n");
-    printf("📌 GPIO10 = HOVERBOARD (Espaco)\n");
-    printf("📌 GPIO11 = PULAR (UP)\n");
-    printf("📌 GPIO12 = DESLIZAR (DOWN)\n\n");
-    
+
+    // Tasks
+    xTaskCreate(task_imu,          "IMU",    TASK_STACK_SIZE, NULL, TASK_IMU_PRIORITY,           NULL);
+    xTaskCreate(task_botoes,       "Botoes", TASK_STACK_SIZE, NULL, TASK_BOTOES_PRIORITY,         NULL);
+    xTaskCreate(task_comunicacao,  "Com",    TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    NULL);
+    xTaskCreate(task_bt_tx,        "BtTX",   TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    NULL);
+    xTaskCreate(task_led,          "LED",    256,             NULL, TASK_LED_PRIORITY,            NULL);
+
+    printf("✅ Tasks criadas — RTOS iniciando!\n");
+    printf("📌 GP2/3  = I2C MPU6050\n");
+    printf("📌 GP4/5  = UART HC-06 (Bluetooth)\n");
+    printf("📌 GP8    = LIGA/DESLIGA\n");
+    printf("📌 GP9    = 2X ESQUERDA\n");
+    printf("📌 GP10   = HOVER (Espaço)\n");
+    printf("📌 GP11   = PULAR\n");
+    printf("📌 GP12   = DESLIZAR\n\n");
+    printf("🎮 Pronto! Conecte via Bluetooth ou USB.\n\n");
+
+        // Logo antes do vTaskStartScheduler() no main():
+    gpio_init(LED_CALIBRADO_PIN);
+    gpio_set_dir(LED_CALIBRADO_PIN, GPIO_OUT);
+    gpio_put(LED_CALIBRADO_PIN, 0);
+
+    // Teste imediato para confirmar que o pino funciona:
+    gpio_put(LED_CALIBRADO_PIN, 1);
+    sleep_ms(300);
+    gpio_put(LED_CALIBRADO_PIN, 0);
+
     vTaskStartScheduler();
-    
     while (1) { tight_loop_contents(); }
     return 0;
 }
