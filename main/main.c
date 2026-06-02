@@ -64,7 +64,7 @@
 #define HC06_RX_PIN     5 
 
 // ========== CONFIGURAÇÕES DOS PINOS ==========
-#define LED_CALIBRADO_PIN 25   // <-- adiciona esta linha junto aos outros defines
+#define LED_CALIBRADO_PIN 16   // <-- adiciona esta linha junto aos outros defines
 
 // ========== TIPOS ==========
 typedef enum {
@@ -193,6 +193,12 @@ static void task_imu(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     int16_t neutral = (int16_t)(sum / CALIBRATION_SAMPLES);
+    for (int i = 0; i < 3; i++) {
+        gpio_put(LED_CALIBRADO_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        gpio_put(LED_CALIBRADO_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
 
     if (xSemaphoreTake(xNeutralMutex, portMAX_DELAY) == pdTRUE) {
         g_neutral_x = neutral;
@@ -239,14 +245,6 @@ static void task_imu(void *pvParameters) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(LOOP_IMU_MS));
     }
 
-    // Pisca 2x para indicar calibração concluída
-    for (int i = 0; i < 2; i++) {
-        gpio_put(LED_CALIBRADO_PIN, 1);
-        vTaskDelay(pdMS_TO_TICKS(400));
-        gpio_put(LED_CALIBRADO_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(400));
-    }
-    vTaskDelete(NULL);
 }
 
 // ========== TASK: BOTÕES ==========
