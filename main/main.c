@@ -20,14 +20,15 @@
 #define I2C_SDA_PIN     2
 #define I2C_SCL_PIN     3
 
-#define BTN_LIGA_PIN              8
+#define BTN_LIGA_PIN                8
 #define BTN_DESLIZE_ESQUERDA_2X_PIN 9
-#define BTN_HOVER_PIN             10
-#define BTN_PULAR_PIN             11
-#define BTN_DESLIZAR_PIN          12
+#define BTN_HOVER_PIN               10
+#define BTN_PULAR_PIN               11
+#define BTN_DESLIZAR_PIN            12
 
-#define LED_CONEXAO_PIN 25
-#define POT_PIN         26
+#define LED_CONEXAO_PIN   25
+#define LED_CALIBRADO_PIN 16
+#define POT_PIN           26
 
 // ========== CONFIGURAÇÕES MPU6050 ==========
 #define MPU6050_ADDR  0x68
@@ -42,31 +43,26 @@
 #define SENS_DEADZONE       1200
 
 // ========== CONFIGURAÇÕES HC-06 ==========
-#define HC06_NAME "SUBWAY_CTRL"
-#define HC06_PIN  "1234"
+#define HC06_NAME      "SUBWAY_CTRL"
+#define HC06_PIN       "1234"
+#define HC06_UART_ID   uart1
+#define HC06_BAUD_RATE 115200
+#define HC06_TX_PIN    4    // Pico TX -> HC-06 RX
+#define HC06_RX_PIN    5
 
 // ========== CONFIGURAÇÕES RTOS ==========
-#define TASK_STACK_SIZE         512     // aumentado para acomodar BT
-#define TASK_IMU_PRIORITY       2
-#define TASK_BOTOES_PRIORITY    2
-#define TASK_COMUNICACAO_PRIORITY 3     // mais alta: não pode perder comandos
-#define TASK_LED_PRIORITY       1
+#define TASK_STACK_SIZE           512
+#define TASK_IMU_PRIORITY         2
+#define TASK_BOTOES_PRIORITY      2
+#define TASK_COMUNICACAO_PRIORITY 3   // mais alta: não pode perder comandos
+#define TASK_LED_PRIORITY         1
 
-#define QUEUE_CMDS_LENGTH   32          // fila de comandos (IMU + botões)
-#define QUEUE_BT_TX_LENGTH  128         // fila de bytes para TX Bluetooth
-#define BTN_DEBOUNCE_MS     50
-#define LOOP_IMU_MS         30
+#define QUEUE_CMDS_LENGTH    32   // fila de comandos (IMU + botões)
+#define QUEUE_BT_TX_LENGTH   128  // fila de bytes para TX Bluetooth
+#define BTN_DEBOUNCE_MS      50
+#define LOOP_IMU_MS          30
 
-// ========== CONFIGURAÇÕES HC-06 ==========
-#define HC06_UART_ID    uart1
-#define HC06_BAUD_RATE  115200
-#define HC06_TX_PIN     4       // Pico TX -> HC-06 RX
-#define HC06_RX_PIN     5 
-
-// ========== CONFIGURAÇÕES DOS PINOS ==========
-#define LED_CALIBRADO_PIN 16   // <-- adiciona esta linha junto aos outros defines
-
-// ========== CONFIGURAÇÕES SMP ========== 
+// ========== CONFIGURAÇÕES SMP ==========
 #define CORE_0 (1 << 0)
 #define CORE_1 (1 << 1)
 
@@ -86,19 +82,30 @@ typedef struct {
 } mensagem_t;
 
 // ========== HANDLES GLOBAIS ==========
-static QueueHandle_t xComandoQueue = NULL;  // fila de comandos do jogo
-static QueueHandle_t xBtTxQueue   = NULL;  // fila de bytes para o HC-06
-static SemaphoreHandle_t xNeutralMutex = NULL;
+static QueueHandle_t xComandoQueue  = NULL;  // fila de comandos do jogo
+static QueueHandle_t xBtTxQueue     = NULL;  // fila de bytes para o HC-06
+static QueueHandle_t xSistemaQueue  = NULL;  // fila de 1 elemento: bool sistema_ligado
 
-static int16_t g_neutral_x    = 0;
-static bool    sistema_ligado = true;
+// ========== HELPERS: ESTADO DO SISTEMA ==========
+// Lê o estado atual sem remover da fila (peek não-bloqueante)
+static bool sistema_esta_ligado(void) {
+    bool estado = true;
+    xQueuePeek(xSistemaQueue, &estado, 0);
+    return estado;
+}
 
-// ========== BLUETOOTH: IRQ RX (não usado ativamente, mas útil para debug) ==========
-// Se quiser receber comandos do celular via BT no futuro, use este handler.
+// Atualiza o estado: esvazia a fila e reinsere o novo valor
+static void sistema_set_ligado(bool ligado) {
+    bool dummy;
+    xQueueReceive(xSistemaQueue, &dummy, 0);  // esvazia
+    xQueueSend(xSistemaQueue, &ligado, 0);    // insere novo valor
+}
+
+// ========== BLUETOOTH: IRQ RX ==========
+// ISR mínima: lê apenas um byte por interrupção — sem loop.
 static void uart_bt_rx_handler(void) {
-    // Descarta por enquanto; estenda aqui para receber ACKs ou comandos remotos
-    while (uart_is_readable(HC06_UART_ID)) {
-        uart_getc(HC06_UART_ID);   // flush
+    if (uart_is_readable(HC06_UART_ID)) {
+        uart_getc(HC06_UART_ID);  // lê um byte e sai; próximo byte dispara novo IRQ
     }
 }
 
@@ -119,7 +126,6 @@ static void init_bt_uart(void) {
 
 // ========== TASK: TX BLUETOOTH ==========
 // Consome xBtTxQueue e envia byte a byte pela UART do HC-06.
-// Separado da task_comunicacao para não bloquear o processamento de comandos.
 static void task_bt_tx(void *pvParameters) {
     uint8_t ch;
     while (1) {
@@ -167,8 +173,8 @@ static bool mpu6050_init(void) {
 
 // ========== HELPER: 2X ESQUERDA ==========
 static void enviar_duas_esquerdas(void) {
-    mensagem_t msg  = {.cmd = CMD_ESQUERDA, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
-    mensagem_t neutro = {.cmd = CMD_NEUTRO,   .timestamp_ms = msg.timestamp_ms};
+    mensagem_t msg   = {.cmd = CMD_ESQUERDA, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
+    mensagem_t neutro = {.cmd = CMD_NEUTRO,  .timestamp_ms = msg.timestamp_ms};
 
     xQueueSend(xComandoQueue, &msg, 0);
     printf("[BOTAO] 1a ESQUERDA\n");
@@ -188,6 +194,7 @@ static void enviar_duas_esquerdas(void) {
 }
 
 // ========== TASK: IMU ==========
+// neutral é variável LOCAL — não precisa de global nem mutex.
 static void task_imu(void *pvParameters) {
     // Calibração inicial
     int32_t sum = 0;
@@ -196,34 +203,30 @@ static void task_imu(void *pvParameters) {
         sum += read_accel_x();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    int16_t neutral = (int16_t)(sum / CALIBRATION_SAMPLES);
+    int16_t neutral = (int16_t)(sum / CALIBRATION_SAMPLES);  // local: só task_imu usa
+
     for (int i = 0; i < 3; i++) {
         gpio_put(LED_CALIBRADO_PIN, 1);
         vTaskDelay(pdMS_TO_TICKS(150));
         gpio_put(LED_CALIBRADO_PIN, 0);
         vTaskDelay(pdMS_TO_TICKS(150));
     }
-
-    if (xSemaphoreTake(xNeutralMutex, portMAX_DELAY) == pdTRUE) {
-        g_neutral_x = neutral;
-        xSemaphoreGive(xNeutralMutex);
-    }
     printf("[IMU] Calibrado! Neutro = %d | Threshold = %d\n", neutral, SENS_THRESHOLD);
-    
 
-    comando_t last_sent = CMD_NEUTRO;
+    comando_t  last_sent = CMD_NEUTRO;
     TickType_t xLastWakeTime;
-    int debug_count = 0;
+    int        debug_count = 0;
 
     while (1) {
-        if (!sistema_ligado) {
+        // Usa helper para ler estado via fila (sem global)
+        if (!sistema_esta_ligado()) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
         xLastWakeTime = xTaskGetTickCount();
 
-        int16_t accel_x  = read_accel_x();
+        int16_t accel_x   = read_accel_x();
         int32_t deviation = (int32_t)accel_x - (int32_t)neutral;
 
         // Debug a cada ~1.5 s
@@ -233,12 +236,12 @@ static void task_imu(void *pvParameters) {
         }
 
         comando_t desired = CMD_NEUTRO;
-        if (deviation >  SENS_THRESHOLD) desired = CMD_DIREITA;
+        if      (deviation >  SENS_THRESHOLD) desired = CMD_DIREITA;
         else if (deviation < -SENS_THRESHOLD) desired = CMD_ESQUERDA;
 
         if (desired != last_sent) {
             mensagem_t msg = {
-                .cmd = (desired != CMD_NEUTRO) ? desired : CMD_NEUTRO,
+                .cmd          = (desired != CMD_NEUTRO) ? desired : CMD_NEUTRO,
                 .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS
             };
             xQueueSend(xComandoQueue, &msg, 0);
@@ -248,18 +251,17 @@ static void task_imu(void *pvParameters) {
 
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(LOOP_IMU_MS));
     }
-
 }
 
 // ========== TASK: BOTÕES ==========
 static void task_botoes(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
-    bool last_liga              = true;
-    bool last_deslize_esq_2x   = true;
-    bool last_hover             = true;
-    bool last_pular             = true;
-    bool last_deslizar          = true;
+    bool last_liga            = true;
+    bool last_deslize_esq_2x  = true;
+    bool last_hover           = true;
+    bool last_pular           = true;
+    bool last_deslizar        = true;
 
     uint32_t t_liga = 0, t_esq2x = 0, t_hover = 0, t_pular = 0, t_deslizar = 0;
 
@@ -270,14 +272,17 @@ static void task_botoes(void *pvParameters) {
         bool cur_liga = gpio_get(BTN_LIGA_PIN);
         if (!cur_liga && last_liga && (now - t_liga) > BTN_DEBOUNCE_MS) {
             t_liga = now;
-            sistema_ligado = !sistema_ligado;
+            // Lê estado atual via fila e inverte
+            bool atual = sistema_esta_ligado();
+            sistema_set_ligado(!atual);
             mensagem_t msg = {.cmd = CMD_NEUTRO, .timestamp_ms = now};
             xQueueSend(xComandoQueue, &msg, 0);
-            printf("[SISTEMA] %s\n", sistema_ligado ? "LIGADO" : "DESLIGADO");
+            printf("[SISTEMA] %s\n", !atual ? "LIGADO" : "DESLIGADO");
         }
         last_liga = cur_liga;
 
-        if (sistema_ligado) {
+        // Usa helper para ler estado via fila (sem global)
+        if (sistema_esta_ligado()) {
             // --- DESLIZE 2X ESQUERDA ---
             bool cur_esq2x = gpio_get(BTN_DESLIZE_ESQUERDA_2X_PIN);
             if (!cur_esq2x && last_deslize_esq_2x && (now - t_esq2x) > BTN_DEBOUNCE_MS) {
@@ -331,17 +336,17 @@ static void task_botoes(void *pvParameters) {
 // ========== TASK: COMUNICAÇÃO (USB Serial + Bluetooth) ==========
 static void task_comunicacao(void *pvParameters) {
     mensagem_t msg;
-    char buf[4];   // ex: "L\n\0"
+    char buf[4];  // ex: "L\n\0"
 
     while (1) {
         if (xQueueReceive(xComandoQueue, &msg, pdMS_TO_TICKS(100))) {
-            if (sistema_ligado || msg.cmd == CMD_NEUTRO) {
+            // Usa helper para ler estado via fila (sem global)
+            if (sistema_esta_ligado() || msg.cmd == CMD_NEUTRO) {
 
                 // 1) Envia pela USB Serial (lido pelo subway_controller.py)
                 printf("%c\n", msg.cmd);
 
                 // 2) Envia pelo Bluetooth (mesmo protocolo: "<CHAR>\n")
-                //    Enfileira na fila BT para task_bt_tx enviar sem bloquear
                 snprintf(buf, sizeof(buf), "%c\n", msg.cmd);
                 bt_enqueue_str(buf);
 
@@ -364,10 +369,11 @@ static void task_comunicacao(void *pvParameters) {
 static void task_led(void *pvParameters) {
     bool led_state = false;
     while (1) {
-        if (sistema_ligado) {
+        // Usa helper para ler estado via fila (sem global)
+        if (sistema_esta_ligado()) {
             led_state = !led_state;
             gpio_put(LED_CONEXAO_PIN, led_state);
-            vTaskDelay(pdMS_TO_TICKS(500));   // pisca lento = ativo
+            vTaskDelay(pdMS_TO_TICKS(500));  // pisca lento = ativo
         } else {
             gpio_put(LED_CONEXAO_PIN, 0);
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -396,10 +402,14 @@ static void setup_hardware(void) {
         gpio_pull_up(btn_pins[i]);
     }
 
-    // LED
+    // LEDs
     gpio_init(LED_CONEXAO_PIN);
     gpio_set_dir(LED_CONEXAO_PIN, GPIO_OUT);
     gpio_put(LED_CONEXAO_PIN, 1);
+
+    gpio_init(LED_CALIBRADO_PIN);
+    gpio_set_dir(LED_CALIBRADO_PIN, GPIO_OUT);
+    gpio_put(LED_CALIBRADO_PIN, 0);
 
     // ADC
     adc_init();
@@ -410,7 +420,7 @@ static void setup_hardware(void) {
 // ========== MAIN ==========
 int main(void) {
     stdio_init_all();
-    sleep_ms(2000);   // aguarda terminal USB
+    sleep_ms(2000);  // aguarda terminal USB
 
     printf("\n========================================\n");
     printf("   SUBWAY SURFERS CONTROLLER - RTOS + BT\n");
@@ -419,12 +429,8 @@ int main(void) {
 
     setup_hardware();
 
-    // Inicializa e configura HC-06
     printf("[BT] Inicializando HC-06...\n");
     init_bt_uart();
-    // Descomente a linha abaixo na PRIMEIRA vez para gravar nome/PIN no módulo.
-    // Depois comente de novo para não perder tempo no boot.
-    // hc06_config(HC06_NAME, HC06_PIN);
     printf("[BT] HC-06 pronto (UART1 @ %d baud)\n\n", HC06_BAUD_RATE);
 
     if (!mpu6050_init()) {
@@ -433,24 +439,27 @@ int main(void) {
     }
     printf("[IMU] MPU6050 inicializado!\n\n");
 
-    // Filas
+    // --- Filas ---
     xComandoQueue = xQueueCreate(QUEUE_CMDS_LENGTH, sizeof(mensagem_t));
     xBtTxQueue    = xQueueCreate(QUEUE_BT_TX_LENGTH, sizeof(uint8_t));
+    // Fila de 1 elemento para o estado liga/desliga (substitui a global)
+    xSistemaQueue = xQueueCreate(1, sizeof(bool));
     configASSERT(xComandoQueue != NULL);
     configASSERT(xBtTxQueue    != NULL);
+    configASSERT(xSistemaQueue != NULL);
 
-    // Semáforos
-    xNeutralMutex = xSemaphoreCreateMutex();
-    configASSERT(xNeutralMutex != NULL);
+    // Estado inicial: ligado = true
+    bool estado_inicial = true;
+    xQueueSend(xSistemaQueue, &estado_inicial, 0);
 
-    // Tasks
+    // --- Tasks ---
     TaskHandle_t hImu, hBotoes, hCom, hBtTx, hLed;
 
-    xTaskCreate(task_imu,          "IMU",    TASK_STACK_SIZE, NULL, TASK_IMU_PRIORITY,           NULL);
-    xTaskCreate(task_botoes,       "Botoes", TASK_STACK_SIZE, NULL, TASK_BOTOES_PRIORITY,         NULL);
-    xTaskCreate(task_comunicacao,  "Com",    TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    NULL);
-    xTaskCreate(task_bt_tx,        "BtTX",   TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    NULL);
-    xTaskCreate(task_led,          "LED",    256,             NULL, TASK_LED_PRIORITY,            NULL);
+    xTaskCreate(task_imu,         "IMU",    TASK_STACK_SIZE, NULL, TASK_IMU_PRIORITY,           &hImu);
+    xTaskCreate(task_botoes,      "Botoes", TASK_STACK_SIZE, NULL, TASK_BOTOES_PRIORITY,         &hBotoes);
+    xTaskCreate(task_comunicacao, "Com",    TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    &hCom);
+    xTaskCreate(task_bt_tx,       "BtTX",   TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    &hBtTx);
+    xTaskCreate(task_led,         "LED",    256,             NULL, TASK_LED_PRIORITY,             &hLed);
 
     // Core 0: leitura de sensores e botões (tempo real, baixa latência)
     vTaskCoreAffinitySet(hImu,    CORE_0);
@@ -461,7 +470,7 @@ int main(void) {
     vTaskCoreAffinitySet(hBtTx,  CORE_1);
     vTaskCoreAffinitySet(hLed,   CORE_1);
 
-    printf("✅ Tasks criadas — RTOS iniciando!\n");
+    printf("✅ Tasks criadas (SMP: Core0=IMU+Botoes | Core1=Com+BT+LED)\n");
     printf("📌 GP2/3  = I2C MPU6050\n");
     printf("📌 GP4/5  = UART HC-06 (Bluetooth)\n");
     printf("📌 GP8    = LIGA/DESLIGA\n");
@@ -470,12 +479,6 @@ int main(void) {
     printf("📌 GP11   = PULAR\n");
     printf("📌 GP12   = DESLIZAR\n\n");
     printf("🎮 Pronto! Conecte via Bluetooth ou USB.\n\n");
-
-        // Logo antes do vTaskStartScheduler() no main():
-    gpio_init(LED_CALIBRADO_PIN);
-    gpio_set_dir(LED_CALIBRADO_PIN, GPIO_OUT);
-    gpio_put(LED_CALIBRADO_PIN, 0);
-
 
     vTaskStartScheduler();
     while (1) { tight_loop_contents(); }
