@@ -66,6 +66,10 @@
 // ========== CONFIGURAÇÕES DOS PINOS ==========
 #define LED_CALIBRADO_PIN 16   // <-- adiciona esta linha junto aos outros defines
 
+// ========== CONFIGURAÇÕES SMP ========== 
+#define CORE_0 (1 << 0)
+#define CORE_1 (1 << 1)
+
 // ========== TIPOS ==========
 typedef enum {
     CMD_ESQUERDA = 'L',
@@ -440,11 +444,22 @@ int main(void) {
     configASSERT(xNeutralMutex != NULL);
 
     // Tasks
+    TaskHandle_t hImu, hBotoes, hCom, hBtTx, hLed;
+
     xTaskCreate(task_imu,          "IMU",    TASK_STACK_SIZE, NULL, TASK_IMU_PRIORITY,           NULL);
     xTaskCreate(task_botoes,       "Botoes", TASK_STACK_SIZE, NULL, TASK_BOTOES_PRIORITY,         NULL);
     xTaskCreate(task_comunicacao,  "Com",    TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    NULL);
     xTaskCreate(task_bt_tx,        "BtTX",   TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    NULL);
     xTaskCreate(task_led,          "LED",    256,             NULL, TASK_LED_PRIORITY,            NULL);
+
+    // Core 0: leitura de sensores e botões (tempo real, baixa latência)
+    vTaskCoreAffinitySet(hImu,    CORE_0);
+    vTaskCoreAffinitySet(hBotoes, CORE_0);
+
+    // Core 1: comunicação e saídas (não bloqueia leitura dos sensores)
+    vTaskCoreAffinitySet(hCom,   CORE_1);
+    vTaskCoreAffinitySet(hBtTx,  CORE_1);
+    vTaskCoreAffinitySet(hLed,   CORE_1);
 
     printf("✅ Tasks criadas — RTOS iniciando!\n");
     printf("📌 GP2/3  = I2C MPU6050\n");
@@ -461,10 +476,6 @@ int main(void) {
     gpio_set_dir(LED_CALIBRADO_PIN, GPIO_OUT);
     gpio_put(LED_CALIBRADO_PIN, 0);
 
-    // Teste imediato para confirmar que o pino funciona:
-    gpio_put(LED_CALIBRADO_PIN, 1);
-    sleep_ms(300);
-    gpio_put(LED_CALIBRADO_PIN, 0);
 
     vTaskStartScheduler();
     while (1) { tight_loop_contents(); }
