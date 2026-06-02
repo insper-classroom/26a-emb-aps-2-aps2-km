@@ -146,10 +146,9 @@ static void init_bt_uart(void) {
 // Lê caracteres enviados pelo Python via USB e coloca na xComandoQueue.
 // Esta task é essencial para receber o 'X' de game over detectado pelo Python.
 static void task_usb_rx(void *pvParameters) {
-    int ch;
     while (1) {
         // Aguarda até 10ms por um caractere na USB Serial
-        ch = getchar_timeout_us(10000);
+        int ch = getchar_timeout_us(10000);
         if (ch != PICO_ERROR_TIMEOUT) {
             comando_t cmd = (comando_t)ch;
             switch (cmd) {
