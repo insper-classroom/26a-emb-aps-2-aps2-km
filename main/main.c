@@ -30,6 +30,15 @@
 #define LED_CALIBRADO_PIN 16
 #define POT_PIN           26
 
+// ========== MOTOR VIBRATÓRIO ==========
+// Ligue via transistor NPN (BC547/2N2222):
+//   GP15 ──[1kΩ]──► Base | Coletor ──► Motor+ | Emissor ──► GND
+//   Diodo 1N4007 em paralelo com o motor (cátodo no VCC)
+#define MOTOR_PIN       17
+#define MOTOR_PULSE_MS  200
+#define MOTOR_PAUSE_MS  150
+#define MOTOR_PULSES    3
+
 // ========== CONFIGURAÇÕES MPU6050 ==========
 #define MPU6050_ADDR  0x68
 #define I2C_BAUD_RATE 400000
@@ -47,18 +56,20 @@
 #define HC06_PIN       "1234"
 #define HC06_UART_ID   uart1
 #define HC06_BAUD_RATE 115200
-#define HC06_TX_PIN    4    // Pico TX -> HC-06 RX
+#define HC06_TX_PIN    4
 #define HC06_RX_PIN    5
 
 // ========== CONFIGURAÇÕES RTOS ==========
 #define TASK_STACK_SIZE           512
 #define TASK_IMU_PRIORITY         2
 #define TASK_BOTOES_PRIORITY      2
-#define TASK_COMUNICACAO_PRIORITY 3   // mais alta: não pode perder comandos
+#define TASK_COMUNICACAO_PRIORITY 3
 #define TASK_LED_PRIORITY         1
+#define TASK_MOTOR_PRIORITY       4
 
-#define QUEUE_CMDS_LENGTH    32   // fila de comandos (IMU + botões)
-#define QUEUE_BT_TX_LENGTH   128  // fila de bytes para TX Bluetooth
+#define QUEUE_CMDS_LENGTH    32
+#define QUEUE_BT_TX_LENGTH   128
+#define QUEUE_MOTOR_LENGTH   4
 #define BTN_DEBOUNCE_MS      50
 #define LOOP_IMU_MS          30
 
@@ -68,12 +79,13 @@
 
 // ========== TIPOS ==========
 typedef enum {
-    CMD_ESQUERDA = 'L',
-    CMD_DIREITA  = 'R',
-    CMD_PULAR    = 'U',
-    CMD_DESLIZAR = 'D',
-    CMD_HOVER    = 'H',
-    CMD_NEUTRO   = 'S'
+    CMD_ESQUERDA  = 'L',
+    CMD_DIREITA   = 'R',
+    CMD_PULAR     = 'U',
+    CMD_DESLIZAR  = 'D',
+    CMD_HOVER     = 'H',
+    CMD_NEUTRO    = 'S',
+    CMD_GAME_OVER = 'X'
 } comando_t;
 
 typedef struct {
@@ -82,30 +94,36 @@ typedef struct {
 } mensagem_t;
 
 // ========== HANDLES GLOBAIS ==========
-static QueueHandle_t xComandoQueue  = NULL;  // fila de comandos do jogo
-static QueueHandle_t xBtTxQueue     = NULL;  // fila de bytes para o HC-06
-static QueueHandle_t xSistemaQueue  = NULL;  // fila de 1 elemento: bool sistema_ligado
+static QueueHandle_t xComandoQueue = NULL;
+static QueueHandle_t xBtTxQueue    = NULL;
+static QueueHandle_t xSistemaQueue = NULL;
+static QueueHandle_t xMotorQueue   = NULL;
 
 // ========== HELPERS: ESTADO DO SISTEMA ==========
-// Lê o estado atual sem remover da fila (peek não-bloqueante)
 static bool sistema_esta_ligado(void) {
     bool estado = true;
     xQueuePeek(xSistemaQueue, &estado, 0);
     return estado;
 }
 
-// Atualiza o estado: esvazia a fila e reinsere o novo valor
 static void sistema_set_ligado(bool ligado) {
     bool dummy;
-    xQueueReceive(xSistemaQueue, &dummy, 0);  // esvazia
-    xQueueSend(xSistemaQueue, &ligado, 0);    // insere novo valor
+    xQueueReceive(xSistemaQueue, &dummy, 0);
+    xQueueSend(xSistemaQueue, &ligado, 0);
 }
 
 // ========== BLUETOOTH: IRQ RX ==========
 // ISR mínima: lê apenas um byte por interrupção — sem loop.
+// Se o Python enviar 'X' via Bluetooth, dispara o motor direto da ISR.
 static void uart_bt_rx_handler(void) {
     if (uart_is_readable(HC06_UART_ID)) {
-        uart_getc(HC06_UART_ID);  // lê um byte e sai; próximo byte dispara novo IRQ
+        uint8_t ch = uart_getc(HC06_UART_ID);
+        if (ch == (uint8_t)CMD_GAME_OVER) {
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            uint8_t sig = 1;
+            xQueueSendFromISR(xMotorQueue, &sig, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
     }
 }
 
@@ -124,8 +142,62 @@ static void init_bt_uart(void) {
     uart_set_irq_enables(HC06_UART_ID, true, false);
 }
 
+// ========== TASK: LEITURA USB SERIAL (stdin) ==========
+// Lê caracteres enviados pelo Python via USB e coloca na xComandoQueue.
+// Esta task é essencial para receber o 'X' de game over detectado pelo Python.
+static void task_usb_rx(void *pvParameters) {
+    int ch;
+    while (1) {
+        // Aguarda até 10ms por um caractere na USB Serial
+        ch = getchar_timeout_us(10000);
+        if (ch != PICO_ERROR_TIMEOUT) {
+            comando_t cmd = (comando_t)ch;
+            switch (cmd) {
+                case CMD_ESQUERDA:
+                case CMD_DIREITA:
+                case CMD_PULAR:
+                case CMD_DESLIZAR:
+                case CMD_HOVER:
+                case CMD_NEUTRO:
+                case CMD_GAME_OVER: {
+                    mensagem_t msg = {
+                        .cmd          = cmd,
+                        .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS
+                    };
+                    xQueueSend(xComandoQueue, &msg, 0);
+                    printf("[USB_RX] Recebido: %c\n", cmd);
+                    break;
+                }
+                default:
+                    break;  // ignora '\n', '\r' e outros bytes
+            }
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+// ========== TASK: MOTOR VIBRATÓRIO ==========
+// Fica bloqueada em portMAX_DELAY (zero CPU) até receber sinal.
+// ========== TASK: MOTOR VIBRATÓRIO ==========
+static void task_motor(void *pvParameters) {
+    uint8_t sinal;
+    while (1) {
+        if (xQueueReceive(xMotorQueue, &sinal, portMAX_DELAY) == pdTRUE) {
+
+            // Esvazia qualquer sinal extra acumulado na fila — evita vibrar em loop
+            while (xQueueReceive(xMotorQueue, &sinal, 0) == pdTRUE) {}
+
+            printf("[MOTOR] Game Over! Vibrando 2 segundos...\n");
+            gpio_put(MOTOR_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(2000));   // vibra 2 segundos contínuos
+            gpio_put(MOTOR_PIN, 0);
+            printf("[MOTOR] Vibracao concluida.\n");
+        }
+    }
+    vTaskDelete(NULL);
+}
+
 // ========== TASK: TX BLUETOOTH ==========
-// Consome xBtTxQueue e envia byte a byte pela UART do HC-06.
 static void task_bt_tx(void *pvParameters) {
     uint8_t ch;
     while (1) {
@@ -173,8 +245,8 @@ static bool mpu6050_init(void) {
 
 // ========== HELPER: 2X ESQUERDA ==========
 static void enviar_duas_esquerdas(void) {
-    mensagem_t msg   = {.cmd = CMD_ESQUERDA, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
-    mensagem_t neutro = {.cmd = CMD_NEUTRO,  .timestamp_ms = msg.timestamp_ms};
+    mensagem_t msg    = {.cmd = CMD_ESQUERDA, .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS};
+    mensagem_t neutro = {.cmd = CMD_NEUTRO,   .timestamp_ms = msg.timestamp_ms};
 
     xQueueSend(xComandoQueue, &msg, 0);
     printf("[BOTAO] 1a ESQUERDA\n");
@@ -194,16 +266,14 @@ static void enviar_duas_esquerdas(void) {
 }
 
 // ========== TASK: IMU ==========
-// neutral é variável LOCAL — não precisa de global nem mutex.
 static void task_imu(void *pvParameters) {
-    // Calibração inicial
     int32_t sum = 0;
     printf("[IMU] Calibrando... Mantenha o controle PARADO!\n");
     for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
         sum += read_accel_x();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    int16_t neutral = (int16_t)(sum / CALIBRATION_SAMPLES);  // local: só task_imu usa
+    int16_t neutral = (int16_t)(sum / CALIBRATION_SAMPLES);
 
     for (int i = 0; i < 3; i++) {
         gpio_put(LED_CALIBRADO_PIN, 1);
@@ -218,7 +288,6 @@ static void task_imu(void *pvParameters) {
     int        debug_count = 0;
 
     while (1) {
-        // Usa helper para ler estado via fila (sem global)
         if (!sistema_esta_ligado()) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -229,7 +298,6 @@ static void task_imu(void *pvParameters) {
         int16_t accel_x   = read_accel_x();
         int32_t deviation = (int32_t)accel_x - (int32_t)neutral;
 
-        // Debug a cada ~1.5 s
         if (++debug_count >= 50) {
             debug_count = 0;
             printf("[IMU] accel=%d neutro=%d desvio=%d\n", accel_x, neutral, deviation);
@@ -257,11 +325,11 @@ static void task_imu(void *pvParameters) {
 static void task_botoes(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
-    bool last_liga            = true;
-    bool last_deslize_esq_2x  = true;
-    bool last_hover           = true;
-    bool last_pular           = true;
-    bool last_deslizar        = true;
+    bool last_liga           = true;
+    bool last_deslize_esq_2x = true;
+    bool last_hover          = true;
+    bool last_pular          = true;
+    bool last_deslizar       = true;
 
     uint32_t t_liga = 0, t_esq2x = 0, t_hover = 0, t_pular = 0, t_deslizar = 0;
 
@@ -272,7 +340,6 @@ static void task_botoes(void *pvParameters) {
         bool cur_liga = gpio_get(BTN_LIGA_PIN);
         if (!cur_liga && last_liga && (now - t_liga) > BTN_DEBOUNCE_MS) {
             t_liga = now;
-            // Lê estado atual via fila e inverte
             bool atual = sistema_esta_ligado();
             sistema_set_ligado(!atual);
             mensagem_t msg = {.cmd = CMD_NEUTRO, .timestamp_ms = now};
@@ -281,7 +348,6 @@ static void task_botoes(void *pvParameters) {
         }
         last_liga = cur_liga;
 
-        // Usa helper para ler estado via fila (sem global)
         if (sistema_esta_ligado()) {
             // --- DESLIZE 2X ESQUERDA ---
             bool cur_esq2x = gpio_get(BTN_DESLIZE_ESQUERDA_2X_PIN);
@@ -321,11 +387,10 @@ static void task_botoes(void *pvParameters) {
             }
             last_deslizar = cur_deslizar;
         } else {
-            // Atualiza estados para não disparar ao religar
             last_deslize_esq_2x = gpio_get(BTN_DESLIZE_ESQUERDA_2X_PIN);
-            last_hover           = gpio_get(BTN_HOVER_PIN);
-            last_pular           = gpio_get(BTN_PULAR_PIN);
-            last_deslizar        = gpio_get(BTN_DESLIZAR_PIN);
+            last_hover          = gpio_get(BTN_HOVER_PIN);
+            last_pular          = gpio_get(BTN_PULAR_PIN);
+            last_deslizar       = gpio_get(BTN_DESLIZAR_PIN);
         }
 
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(20));
@@ -334,30 +399,59 @@ static void task_botoes(void *pvParameters) {
 }
 
 // ========== TASK: COMUNICAÇÃO (USB Serial + Bluetooth) ==========
+// Recebe da xComandoQueue (incluindo CMD_GAME_OVER vindo da task_usb_rx)
+// e despacha: saída USB, saída BT, e sinal para o motor se for game over.
 static void task_comunicacao(void *pvParameters) {
     mensagem_t msg;
-    char buf[4];  // ex: "L\n\0"
+    char buf[4];
 
     while (1) {
         if (xQueueReceive(xComandoQueue, &msg, pdMS_TO_TICKS(100))) {
-            // Usa helper para ler estado via fila (sem global)
-            if (sistema_esta_ligado() || msg.cmd == CMD_NEUTRO) {
-
-                // 1) Envia pela USB Serial (lido pelo subway_controller.py)
-                printf("%c\n", msg.cmd);
-
-                // 2) Envia pelo Bluetooth (mesmo protocolo: "<CHAR>\n")
-                snprintf(buf, sizeof(buf), "%c\n", msg.cmd);
-                bt_enqueue_str(buf);
-
-                // Debug visual no terminal USB
+            if (sistema_esta_ligado() || msg.cmd == CMD_NEUTRO
+                                    || msg.cmd == CMD_GAME_OVER) {
                 switch (msg.cmd) {
-                    case CMD_ESQUERDA: printf("  [BT+USB] ESQUERDA\n");   break;
-                    case CMD_DIREITA:  printf("  [BT+USB] DIREITA\n");    break;
-                    case CMD_PULAR:    printf("  [BT+USB] PULAR\n");      break;
-                    case CMD_DESLIZAR: printf("  [BT+USB] DESLIZAR\n");   break;
-                    case CMD_HOVER:    printf("  [BT+USB] HOVERBOARD\n"); break;
-                    case CMD_NEUTRO:   break;
+                    case CMD_ESQUERDA:
+                        printf("%c\n", msg.cmd);
+                        snprintf(buf, sizeof(buf), "%c\n", msg.cmd);
+                        bt_enqueue_str(buf);
+                        printf("  [COM] ESQUERDA\n");
+                        break;
+                    case CMD_DIREITA:
+                        printf("%c\n", msg.cmd);
+                        snprintf(buf, sizeof(buf), "%c\n", msg.cmd);
+                        bt_enqueue_str(buf);
+                        printf("  [COM] DIREITA\n");
+                        break;
+                    case CMD_PULAR:
+                        printf("%c\n", msg.cmd);
+                        snprintf(buf, sizeof(buf), "%c\n", msg.cmd);
+                        bt_enqueue_str(buf);
+                        printf("  [COM] PULAR\n");
+                        break;
+                    case CMD_DESLIZAR:
+                        printf("%c\n", msg.cmd);
+                        snprintf(buf, sizeof(buf), "%c\n", msg.cmd);
+                        bt_enqueue_str(buf);
+                        printf("  [COM] DESLIZAR\n");
+                        break;
+                    case CMD_HOVER:
+                        printf("%c\n", msg.cmd);
+                        snprintf(buf, sizeof(buf), "%c\n", msg.cmd);
+                        bt_enqueue_str(buf);
+                        printf("  [COM] HOVERBOARD\n");
+                        break;
+                    case CMD_NEUTRO:
+                        printf("%c\n", msg.cmd);
+                        snprintf(buf, sizeof(buf), "%c\n", msg.cmd);
+                        bt_enqueue_str(buf);
+                        break;
+                    case CMD_GAME_OVER: {
+                        // NÃO ecoa pela serial nem BT — evita loop com Python
+                        printf("  [COM] GAME OVER -> motor!\n");
+                        uint8_t sig = 1;
+                        xQueueSend(xMotorQueue, &sig, 0);
+                        break;
+                    }
                 }
             }
         }
@@ -369,11 +463,10 @@ static void task_comunicacao(void *pvParameters) {
 static void task_led(void *pvParameters) {
     bool led_state = false;
     while (1) {
-        // Usa helper para ler estado via fila (sem global)
         if (sistema_esta_ligado()) {
             led_state = !led_state;
             gpio_put(LED_CONEXAO_PIN, led_state);
-            vTaskDelay(pdMS_TO_TICKS(500));  // pisca lento = ativo
+            vTaskDelay(pdMS_TO_TICKS(500));
         } else {
             gpio_put(LED_CONEXAO_PIN, 0);
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -384,14 +477,12 @@ static void task_led(void *pvParameters) {
 
 // ========== HARDWARE ==========
 static void setup_hardware(void) {
-    // I2C (MPU6050)
     i2c_init(I2C_PORT, I2C_BAUD_RATE);
     gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA_PIN);
     gpio_pull_up(I2C_SCL_PIN);
 
-    // Botões
     const uint btn_pins[] = {
         BTN_LIGA_PIN, BTN_DESLIZE_ESQUERDA_2X_PIN,
         BTN_HOVER_PIN, BTN_PULAR_PIN, BTN_DESLIZAR_PIN
@@ -402,7 +493,6 @@ static void setup_hardware(void) {
         gpio_pull_up(btn_pins[i]);
     }
 
-    // LEDs
     gpio_init(LED_CONEXAO_PIN);
     gpio_set_dir(LED_CONEXAO_PIN, GPIO_OUT);
     gpio_put(LED_CONEXAO_PIN, 1);
@@ -411,7 +501,10 @@ static void setup_hardware(void) {
     gpio_set_dir(LED_CALIBRADO_PIN, GPIO_OUT);
     gpio_put(LED_CALIBRADO_PIN, 0);
 
-    // ADC
+    gpio_init(MOTOR_PIN);
+    gpio_set_dir(MOTOR_PIN, GPIO_OUT);
+    gpio_put(MOTOR_PIN, 0);
+
     adc_init();
     adc_gpio_init(POT_PIN);
     adc_select_input(0);
@@ -420,11 +513,11 @@ static void setup_hardware(void) {
 // ========== MAIN ==========
 int main(void) {
     stdio_init_all();
-    sleep_ms(2000);  // aguarda terminal USB
+    sleep_ms(2000);
 
     printf("\n========================================\n");
     printf("   SUBWAY SURFERS CONTROLLER - RTOS + BT\n");
-    printf("   IMU MPU6050 | Bluetooth HC-06\n");
+    printf("   IMU MPU6050 | Bluetooth HC-06 | Motor\n");
     printf("========================================\n\n");
 
     setup_hardware();
@@ -439,46 +532,43 @@ int main(void) {
     }
     printf("[IMU] MPU6050 inicializado!\n\n");
 
-    // --- Filas ---
     xComandoQueue = xQueueCreate(QUEUE_CMDS_LENGTH, sizeof(mensagem_t));
     xBtTxQueue    = xQueueCreate(QUEUE_BT_TX_LENGTH, sizeof(uint8_t));
-    // Fila de 1 elemento para o estado liga/desliga (substitui a global)
     xSistemaQueue = xQueueCreate(1, sizeof(bool));
+    xMotorQueue   = xQueueCreate(QUEUE_MOTOR_LENGTH, sizeof(uint8_t));
     configASSERT(xComandoQueue != NULL);
     configASSERT(xBtTxQueue    != NULL);
     configASSERT(xSistemaQueue != NULL);
+    configASSERT(xMotorQueue   != NULL);
 
-    // Estado inicial: ligado = true
     bool estado_inicial = true;
     xQueueSend(xSistemaQueue, &estado_inicial, 0);
 
-    // --- Tasks ---
-    TaskHandle_t hImu, hBotoes, hCom, hBtTx, hLed;
+    TaskHandle_t hImu, hBotoes, hCom, hBtTx, hLed, hMotor, hUsbRx;
 
     xTaskCreate(task_imu,         "IMU",    TASK_STACK_SIZE, NULL, TASK_IMU_PRIORITY,           &hImu);
     xTaskCreate(task_botoes,      "Botoes", TASK_STACK_SIZE, NULL, TASK_BOTOES_PRIORITY,         &hBotoes);
     xTaskCreate(task_comunicacao, "Com",    TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    &hCom);
-    xTaskCreate(task_bt_tx,       "BtTX",   TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    &hBtTx);
-    xTaskCreate(task_led,         "LED",    256,             NULL, TASK_LED_PRIORITY,             &hLed);
+    xTaskCreate(task_bt_tx,       "BtTX",  TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    &hBtTx);
+    xTaskCreate(task_led,         "LED",   256,             NULL, TASK_LED_PRIORITY,             &hLed);
+    xTaskCreate(task_motor,       "Motor", TASK_STACK_SIZE,             NULL, TASK_MOTOR_PRIORITY,           &hMotor);
+    xTaskCreate(task_usb_rx,      "UsbRX", TASK_STACK_SIZE, NULL, TASK_COMUNICACAO_PRIORITY,    &hUsbRx);
 
-    // Core 0: leitura de sensores e botões (tempo real, baixa latência)
+    // Core 0: sensores e botões (tempo real)
     vTaskCoreAffinitySet(hImu,    CORE_0);
     vTaskCoreAffinitySet(hBotoes, CORE_0);
 
-    // Core 1: comunicação e saídas (não bloqueia leitura dos sensores)
+    // Core 1: toda comunicação e saídas
     vTaskCoreAffinitySet(hCom,   CORE_1);
     vTaskCoreAffinitySet(hBtTx,  CORE_1);
     vTaskCoreAffinitySet(hLed,   CORE_1);
+    vTaskCoreAffinitySet(hMotor, CORE_1);
+    vTaskCoreAffinitySet(hUsbRx, CORE_1);
 
-    printf("✅ Tasks criadas (SMP: Core0=IMU+Botoes | Core1=Com+BT+LED)\n");
-    printf("📌 GP2/3  = I2C MPU6050\n");
-    printf("📌 GP4/5  = UART HC-06 (Bluetooth)\n");
-    printf("📌 GP8    = LIGA/DESLIGA\n");
-    printf("📌 GP9    = 2X ESQUERDA\n");
-    printf("📌 GP10   = HOVER (Espaço)\n");
-    printf("📌 GP11   = PULAR\n");
-    printf("📌 GP12   = DESLIZAR\n\n");
-    printf("🎮 Pronto! Conecte via Bluetooth ou USB.\n\n");
+    printf("Tasks criadas (SMP: Core0=IMU+Botoes | Core1=Com+BT+LED+Motor+UsbRX)\n");
+    printf("GP2/3=I2C  GP4/5=BT  GP8=Liga   GP9=2xEsq\n");
+    printf("GP10=Hover GP11=Pular GP12=Deslizar GP15=Motor\n\n");
+    printf("Pronto! Python envia 'X' via USB -> UsbRX -> Motor vibra!\n\n");
 
     vTaskStartScheduler();
     while (1) { tight_loop_contents(); }
